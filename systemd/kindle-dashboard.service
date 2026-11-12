@@ -1,0 +1,14 @@
+[Unit]
+Description=Kindle Paperwhite 4 Pasadena Zen Desk Dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/billy/kindle-display
+ExecStart=/usr/bin/python3 /home/billy/kindle-display/dashboard.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

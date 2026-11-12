@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+output/
+kindle-packages/
+POST_REBOOT_NOTES.md
+.DS_Store

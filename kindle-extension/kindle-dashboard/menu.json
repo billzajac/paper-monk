@@ -1,0 +1,28 @@
+{
+    "items": [
+        {
+            "name": "Pasadena Zen Dashboard",
+            "priority": 1,
+            "items": [
+                {
+                    "name": "Start Desk Mode (USB Push + Keep Awake)",
+                    "priority": 1,
+                    "action": "./bin/dashboard_ctl.sh",
+                    "params": "usb_start"
+                },
+                {
+                    "name": "Start Wi-Fi Pull Loop (from 192.168.50.222)",
+                    "priority": 2,
+                    "action": "./bin/dashboard_ctl.sh",
+                    "params": "wifi_pull_start"
+                },
+                {
+                    "name": "Stop Dashboard & Restore Normal Kindle",
+                    "priority": 3,
+                    "action": "./bin/dashboard_ctl.sh",
+                    "params": "stop"
+                }
+            ]
+        }
+    ]
+}

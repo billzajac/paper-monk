@@ -1,0 +1,42 @@
+{
+  "location": {
+    "name": "Pasadena, California",
+    "short_name": "PASADENA \u00b7 CALIFORNIA",
+    "latitude": 34.1478,
+    "longitude": -118.1445,
+    "timezone": "America/Los_Angeles"
+  },
+  "display": {
+    "width": 1072,
+    "height": 1448,
+    "orientation": "landscape",
+    "theme": "light",
+    "time_format_24h": false,
+    "full_refresh_every_n_pushes": 20
+  },
+  "quotes": {
+    "rotate_minutes": 60,
+    "author_filter": "all",
+    "buddy_mode": "auto"
+  },
+  "weather": {
+    "refresh_minutes": 15
+  },
+  "kindle": {
+    "enabled": true,
+    "featherweight_mode": true,
+    "frontlight_mode": "touch",
+    "frontlight_level": 14,
+    "frontlight_seconds": 20,
+    "host": "192.168.15.244",
+    "user": "root",
+    "port": 22,
+    "ssh_key": "~/.ssh/kindle_usbnet",
+    "default_password": "kindle",
+    "remote_image_path": "/tmp/dashboard.png"
+  },
+  "server": {
+    "host": "0.0.0.0",
+    "port": 8788
+  }
+}

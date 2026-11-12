@@ -23,14 +23,19 @@ for sysf in /sys/class/input/event*; do
 done
 [ -z "$TOUCH_DEV" ] && TOUCH_DEV="/dev/input/event2"
 
-# Terminate any previous instance cleanly
+# Terminate any previous instance cleanly (both via PID file and cmdline match)
 if [ -f "$PID_FILE" ]; then
     OLD_PID="$(cat "$PID_FILE" 2>/dev/null || true)"
     if [ -n "$OLD_PID" ] && [ "$OLD_PID" != "$$" ] && kill -0 "$OLD_PID" 2>/dev/null; then
         kill "$OLD_PID" 2>/dev/null || true
-        usleep 150000 2>/dev/null || sleep 1
     fi
 fi
+for pid in $(ps aux 2>/dev/null | awk '/zen_touch_light\.conf/ {print $2}'); do
+    if [ -n "$pid" ] && [ "$pid" != "$$" ]; then
+        kill "$pid" 2>/dev/null || true
+    fi
+done
+usleep 100000 2>/dev/null || sleep 1
 echo "$$" > "$PID_FILE"
 
 LUAJIT_BIN="/mnt/us/koreader/luajit"
@@ -121,16 +126,75 @@ local function set_light(val)
     end
 end
 
+local function shell_quote(s)
+    return "'" .. tostring(s or ""):gsub("'", "'\\''") .. "'"
+end
+
 local function trigger_rotate(cfg)
-    os.execute(
-        string.format(
-            "(/mnt/us/libkh/bin/fbink -qpmh -y -2 ' Rotating 90 deg... ' >/dev/null 2>&1 || true; " ..
-            "wget -T 4 -q -O /dev/null '%s/api/rotate' 2>/dev/null || " ..
-            "wget -T 4 -q -O /dev/null '%s/api/rotate' 2>/dev/null || true) &",
-            cfg.HOST_USB,
-            cfg.HOST_LAN
-        )
+    local inner = [=[
+LOCK_DIR="/tmp/zen_rotate.lock"
+PENDING_FILE="/tmp/zen_rotate_pending"
+IMG_FILE="/tmp/dashboard.png"
+
+if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+    OLD_PID="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
+    if [ -n "$OLD_PID" ] && kill -0 "$OLD_PID" 2>/dev/null; then
+        : > "$PENDING_FILE"
+        exit 0
+    fi
+    rm -rf "$LOCK_DIR" 2>/dev/null || true
+    mkdir "$LOCK_DIR" 2>/dev/null || exit 0
+fi
+echo "$$" > "$LOCK_DIR/pid"
+TMP_IMG="/tmp/dashboard.png.rot.$$"
+trap 'rm -f "$TMP_IMG"; rm -rf "$LOCK_DIR" 2>/dev/null || true' EXIT INT TERM
+
+FBINK_BIN="$(command -v fbink || ls /mnt/us/libkh/bin/fbink /mnt/us/koreader/fbink /mnt/us/usbnet/bin/fbink 2>/dev/null | head -n 1)"
+
+while true; do
+    rm -f "$PENDING_FILE" "$TMP_IMG"
+    if [ -n "$FBINK_BIN" ]; then
+        "$FBINK_BIN" -qpmh -y -2 " Rotating 90 deg... " >/dev/null 2>&1 || true
+    fi
+
+    FETCH_OK=0
+    if [ "$(cat /sys/class/net/usb0/carrier 2>/dev/null)" = "1" ]; then
+        if wget -T 6 -q -O "$TMP_IMG" "$HOST_USB/api/rotate?format=png" 2>/dev/null && [ -s "$TMP_IMG" ]; then
+            FETCH_OK=1
+        elif wget -T 8 -q -O "$TMP_IMG" "$HOST_LAN/api/rotate?format=png" 2>/dev/null && [ -s "$TMP_IMG" ]; then
+            FETCH_OK=1
+        fi
+    else
+        if wget -T 8 -q -O "$TMP_IMG" "$HOST_LAN/api/rotate?format=png" 2>/dev/null && [ -s "$TMP_IMG" ]; then
+            FETCH_OK=1
+        elif wget -T 2 -q -O "$TMP_IMG" "$HOST_USB/api/rotate?format=png" 2>/dev/null && [ -s "$TMP_IMG" ]; then
+            FETCH_OK=1
+        fi
+    fi
+
+    if [ "$FETCH_OK" = "1" ] && [ "$(wc -c < "$TMP_IMG" 2>/dev/null || echo 0)" -ge 1024 ]; then
+        mv -f "$TMP_IMG" "$IMG_FILE"
+        if [ ! -f "$PENDING_FILE" ]; then
+            { [ -n "$FBINK_BIN" ] && "$FBINK_BIN" -q -c -f -g "file=$IMG_FILE" >/dev/null 2>&1; } || /usr/sbin/eips -f -g "$IMG_FILE" >/dev/null 2>&1 || true
+        fi
+    else
+        rm -f "$TMP_IMG"
+        if [ -s "$IMG_FILE" ]; then
+            { [ -n "$FBINK_BIN" ] && "$FBINK_BIN" -q -c -f -g "file=$IMG_FILE" >/dev/null 2>&1; } || /usr/sbin/eips -f -g "$IMG_FILE" >/dev/null 2>&1 || true
+        fi
+        break
+    fi
+
+    [ -f "$PENDING_FILE" ] || break
+done
+]=]
+    local cmd = string.format(
+        "HOST_USB=%s HOST_LAN=%s /bin/sh -c %s >/dev/null 2>&1 &",
+        shell_quote(cfg.HOST_USB),
+        shell_quote(cfg.HOST_LAN),
+        shell_quote(inner)
     )
+    os.execute(cmd)
 end
 
 -- Apply initial frontlight mode on startup

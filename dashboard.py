@@ -20,10 +20,10 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 from zoneinfo import ZoneInfo
 
-from quotes import AUTHORS, BUDDY_BY_KEY, ZEN_BUDDIES, Quote, ZenBuddy, select_quote_and_buddy
+from quotes import AUTHORS, BUDDY_BY_KEY, ZEN_BUDDIES, Quote, QuoteDeck, ZenBuddy, select_quote_and_buddy
 from renderer import render_dashboard_files, render_svg
 from weather import WeatherData, fetch_weather
 
@@ -34,6 +34,7 @@ SVG_PATH = OUTPUT_DIR / "dashboard.svg"
 PNG_PATH = OUTPUT_DIR / "dashboard.png"
 PREVIEW_PNG_PATH = OUTPUT_DIR / "dashboard_preview.png"
 WEATHER_CACHE_PATH = OUTPUT_DIR / "weather_cache.json"
+QUOTE_DECK_STATE_PATH = OUTPUT_DIR / "quote_deck_state.json"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -58,17 +59,46 @@ SSH_COMPAT_OPTS = [
 ]
 
 
+def _detect_lan_ip(default: str = "192.168.50.222") -> str:
+    """Detect primary physical LAN IPv4 address (ignoring USBNet, VPN, and container bridges)."""
+    try:
+        res = subprocess.run(
+            ["ip", "-4", "-o", "addr", "show", "scope", "global"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=2,
+        )
+        for line in res.stdout.splitlines():
+            parts = line.split()
+            if len(parts) < 4:
+                continue
+            iface = parts[1]
+            ip = parts[3].split("/")[0]
+            if ip.startswith(("127.", "192.168.15.", "100.64.")):
+                continue
+            if iface.startswith(("lo", "usb", "docker", "podman", "br-", "veth", "wg", "tailscale", "tun", "tap")):
+                continue
+            return ip
+    except Exception:
+        pass
+    return default
+
+
 class DashboardState:
     def __init__(self, config_path: Path = CONFIG_PATH) -> None:
         self.config_path = config_path
         self.lock = threading.Lock()
+        self.op_lock = threading.RLock()
         self.config = self._load_config()
+        self.quote_deck = QuoteDeck(QUOTE_DECK_STATE_PATH)
         self.quote_offset: int = 0
         self.push_count: int = 0
         self.last_render_epoch: float = 0.0
         self.last_push_epoch: float = 0.0
         self.last_push_ok: bool = False
         self.last_push_msg: str = "Waiting for Kindle USBNetwork (192.168.15.244)"
+        self.last_kindle_lan_ip: str = str(self.config.get("kindle", {}).get("fallback_host", "")).strip()
         self.latest_weather: WeatherData | None = None
         self.latest_quote: Quote | None = None
         self.latest_buddy: ZenBuddy | None = None
@@ -77,87 +107,127 @@ class DashboardState:
         return json.loads(self.config_path.read_text(encoding="utf-8"))
 
     def save_config(self) -> None:
-        self.config_path.write_text(json.dumps(self.config, indent=2) + "\n", encoding="utf-8")
+        tmp_path = self.config_path.with_suffix(".json.tmp")
+        tmp_path.write_text(json.dumps(self.config, indent=2) + "\n", encoding="utf-8")
+        os.replace(tmp_path, self.config_path)
 
-    def rotate_clockwise(self) -> str:
+    def note_kindle_client(self, client_ip: str) -> None:
+        ip = (client_ip or "").strip()
+        if not ip or ip in ("127.0.0.1", "::1") or ip.startswith("192.168.15."):
+            return
+        lan_ip = _detect_lan_ip("")
+        if ip == lan_ip:
+            return
         with self.lock:
-            disp = self.config["display"]
-            cur = str(disp.get("orientation", "portrait"))
-            idx = ROTATION_ORDER.index(cur) if cur in ROTATION_ORDER else 0
-            nxt = ROTATION_ORDER[(idx + 1) % len(ROTATION_ORDER)]
-            disp["orientation"] = nxt
-            self.save_config()
-        self.render_now()
-        self.push_to_kindle(force_full_refresh=True)
-        log.info("Rotated orientation 90° CW -> %s", nxt)
-        return nxt
+            self.last_kindle_lan_ip = ip
 
-    def render_now(self) -> tuple[WeatherData, Quote, ZenBuddy]:
+    def rotate_clockwise(self, push: bool = True, client_ip: str | None = None) -> str:
+        with self.op_lock:
+            with self.lock:
+                disp = self.config["display"]
+                cur = str(disp.get("orientation", "portrait"))
+                idx = ROTATION_ORDER.index(cur) if cur in ROTATION_ORDER else 0
+                nxt = ROTATION_ORDER[(idx + 1) % len(ROTATION_ORDER)]
+                disp["orientation"] = nxt
+                self.save_config()
+            self.render_now(prefer_cached_weather=True)
+            if push:
+                self.push_to_kindle(force_full_refresh=True)
+            else:
+                src = client_ip or "Kindle touch"
+                msg = f"Live on Kindle ({src} · rotated -> {nxt})"
+                with self.lock:
+                    self.push_count += 1
+                    self.last_push_epoch = time.time()
+                    self.last_push_ok = True
+                    self.last_push_msg = msg
+                log.info(msg)
+            log.info("Rotated orientation 90° CW -> %s", nxt)
+            return nxt
+
+    def render_now(
+        self,
+        prefer_cached_weather: bool = False,
+        advance_quote: bool = True,
+    ) -> tuple[WeatherData, Quote, ZenBuddy]:
         with self.lock:
             cfg = self.config
             loc = dict(cfg["location"])
-            disp = dict(cfg["display"])
-            q_cfg = dict(cfg["quotes"])
+            disp_init = dict(cfg["display"])
             w_cfg = dict(cfg["weather"])
-            offset = self.quote_offset
+            cached_weather = self.latest_weather
 
-        orientation = str(disp.get("orientation", "portrait"))
-        use_24h = bool(disp.get("time_format_24h", False))
+        if prefer_cached_weather and cached_weather is not None:
+            weather = cached_weather
+        else:
+            weather = fetch_weather(
+                latitude=float(loc["latitude"]),
+                longitude=float(loc["longitude"]),
+                timezone=str(loc["timezone"]),
+                location_name=str(loc["name"]),
+                cache_path=WEATHER_CACHE_PATH,
+                refresh_minutes=int(w_cfg.get("refresh_minutes", 15)),
+                use_24h=bool(disp_init.get("time_format_24h", False)),
+            )
 
-        weather = fetch_weather(
-            latitude=float(loc["latitude"]),
-            longitude=float(loc["longitude"]),
-            timezone=str(loc["timezone"]),
-            location_name=str(loc["name"]),
-            cache_path=WEATHER_CACHE_PATH,
-            refresh_minutes=int(w_cfg.get("refresh_minutes", 15)),
-            use_24h=use_24h,
-        )
-        quote, buddy = select_quote_and_buddy(
-            rotate_minutes=int(q_cfg.get("rotate_minutes", 60)),
-            offset=offset,
-            author_filter=str(q_cfg.get("author_filter", "all")),
-            buddy_mode=str(q_cfg.get("buddy_mode", "auto")),
-        )
-        now_dt = datetime.now(ZoneInfo(str(loc["timezone"])))
-        svg = render_svg(
-            weather=weather,
-            quote=quote,
-            buddy=buddy,
-            now=now_dt,
-            tz_name=str(loc["timezone"]),
-            short_location=str(loc.get("short_name", "PASADENA · CALIFORNIA")),
-            theme=str(disp.get("theme", "light")),
-            use_24h=use_24h,
-            orientation=orientation,
-        )
-        render_dashboard_files(
-            svg_content=svg,
-            svg_path=SVG_PATH,
-            png_path=PNG_PATH,
-            preview_png_path=PREVIEW_PNG_PATH,
-            width=int(disp.get("width", 1072)),
-            height=int(disp.get("height", 1448)),
-            orientation=orientation,
-        )
+        with self.op_lock:
+            with self.lock:
+                cfg = self.config
+                loc = dict(cfg["location"])
+                disp = dict(cfg["display"])
+                q_cfg = dict(cfg["quotes"])
+                offset = self.quote_offset
 
-        with self.lock:
-            self.latest_weather = weather
-            self.latest_quote = quote
-            self.latest_buddy = buddy
-            self.last_render_epoch = time.time()
+            orientation = str(disp.get("orientation", "portrait"))
+            use_24h = bool(disp.get("time_format_24h", False))
 
-        log.info(
-            "Rendered %s [%s] (%d°C / %d°F, %s — %s · %s)",
-            PNG_PATH.name,
-            orientation,
-            weather.temp_c,
-            weather.temp_f,
-            weather.condition,
-            quote.author,
-            buddy.label,
-        )
-        return weather, quote, buddy
+            quote, buddy = select_quote_and_buddy(
+                rotate_minutes=int(q_cfg.get("rotate_minutes", 1)),
+                offset=offset,
+                author_filter=str(q_cfg.get("author_filter", "all")),
+                buddy_mode=str(q_cfg.get("buddy_mode", "auto")),
+                deck=self.quote_deck,
+                advance=advance_quote,
+            )
+            now_dt = datetime.now(ZoneInfo(str(loc["timezone"])))
+            svg = render_svg(
+                weather=weather,
+                quote=quote,
+                buddy=buddy,
+                now=now_dt,
+                tz_name=str(loc["timezone"]),
+                short_location=str(loc.get("short_name", "PASADENA · CALIFORNIA")),
+                theme=str(disp.get("theme", "light")),
+                use_24h=use_24h,
+                orientation=orientation,
+            )
+            render_dashboard_files(
+                svg_content=svg,
+                svg_path=SVG_PATH,
+                png_path=PNG_PATH,
+                preview_png_path=PREVIEW_PNG_PATH,
+                width=int(disp.get("width", 1072)),
+                height=int(disp.get("height", 1448)),
+                orientation=orientation,
+            )
+
+            with self.lock:
+                self.latest_weather = weather
+                self.latest_quote = quote
+                self.latest_buddy = buddy
+                self.last_render_epoch = time.time()
+
+            log.info(
+                "Rendered %s [%s] (%d°C / %d°F, %s — %s · %s)",
+                PNG_PATH.name,
+                orientation,
+                weather.temp_c,
+                weather.temp_f,
+                weather.condition,
+                quote.author,
+                buddy.label,
+            )
+            return weather, quote, buddy
 
     def _bootstrap_ssh_key(self, host: str, port: int, user: str, ssh_key_path: Path, default_pw: str) -> bool:
         """Automatically enroll SSH public key on first USBNetLite/USBNetwork connection using OpenSSH ASKPASS."""
@@ -217,127 +287,145 @@ class DashboardState:
         return False
 
     def push_to_kindle(self, force_full_refresh: bool = False) -> tuple[bool, str]:
-        with self.lock:
-            k_cfg = dict(self.config.get("kindle", {}))
-            disp = dict(self.config.get("display", {}))
-            push_num = self.push_count
-
-        if not k_cfg.get("enabled", True):
-            return False, "Kindle SSH push disabled in config.json"
-
-        host = str(k_cfg.get("host", "192.168.15.244"))
-        port = int(k_cfg.get("port", 22))
-        user = str(k_cfg.get("user", "root"))
-        ssh_key = str(k_cfg.get("ssh_key", "")).strip()
-        default_pw = str(k_cfg.get("default_password", "kindle"))
-        remote_img = str(k_cfg.get("remote_image_path", "/tmp/dashboard.png"))
-        full_every = max(1, int(disp.get("full_refresh_every_n_pushes", 20)))
-
-        try:
-            with socket.create_connection((host, port), timeout=1.5):
-                pass
-        except OSError:
-            msg = f"Standby · Waiting for Kindle at {host}:{port} (;un)"
+        with self.op_lock:
             with self.lock:
-                self.last_push_ok = False
-                self.last_push_msg = msg
-            return False, msg
+                k_cfg = dict(self.config.get("kindle", {}))
+                disp = dict(self.config.get("display", {}))
+                srv_port = int(self.config.get("server", {}).get("port", 8788))
+                push_num = self.push_count
+                learned_lan_ip = self.last_kindle_lan_ip
 
-        featherweight = bool(k_cfg.get("featherweight_mode", True))
-        fl_mode = str(k_cfg.get("frontlight_mode", "touch"))
-        fl_level = max(1, min(24, int(k_cfg.get("frontlight_level", 14))))
-        fl_secs = max(5, int(k_cfg.get("frontlight_seconds", 20)))
-        do_full = force_full_refresh or (push_num % full_every == 0)
-        q_remote = shlex.quote(remote_img)
+            if not k_cfg.get("enabled", True):
+                return False, "Kindle SSH push disabled in config.json"
 
-        fw_snippet = (
-            'if status lab126_gui 2>/dev/null | grep -q "start/running"; then stop lab126_gui >/dev/null 2>&1 || true; sleep 1; fi; '
-            if featherweight
-            else ""
-        )
-        srv_port = int(self.config.get("server", {}).get("port", 8788))
-        fl_conf = (
-            f'printf "MODE={fl_mode}\\nBRIGHT={fl_level}\\nHOLD_SECS={fl_secs}\\n'
-            f'HOST_USB=http://192.168.15.201:{srv_port}\\nHOST_LAN=http://192.168.50.222:{srv_port}\\n" > /tmp/zen_touch_light.conf; '
-            'LPID=$(cat /tmp/zen_touch_light.pid 2>/dev/null || true); '
-            'if [ -z "$LPID" ] || ! kill -0 "$LPID" 2>/dev/null; then '
-            "rm -f /tmp/zen_touch_light.pid; "
-            "start-stop-daemon -S -b -p /tmp/zen_touch_light.pid -x /bin/sh -- /mnt/us/extensions/kindle-dashboard/bin/touch_light.sh >/dev/null 2>&1 || true; "
-            "fi; "
-        )
-        if fl_mode == "off":
-            fl_snippet = fl_conf + "lipc-set-prop -i com.lab126.powerd flIntensity 0 >/dev/null 2>&1 || true; "
-        elif fl_mode == "always":
-            fl_snippet = fl_conf + f"lipc-set-prop -i com.lab126.powerd flIntensity {fl_level} >/dev/null 2>&1 || true; "
-        else:
-            fl_snippet = fl_conf
+            primary_host = str(k_cfg.get("host", "192.168.15.244")).strip()
+            cfg_fallback = str(k_cfg.get("fallback_host", "")).strip()
+            port = int(k_cfg.get("port", 22))
+            user = str(k_cfg.get("user", "root"))
+            ssh_key = str(k_cfg.get("ssh_key", "")).strip()
+            default_pw = str(k_cfg.get("default_password", "kindle"))
+            remote_img = str(k_cfg.get("remote_image_path", "/tmp/dashboard.png"))
+            full_every = max(1, int(disp.get("full_refresh_every_n_pushes", 20)))
 
-        draw_cmd = (
-            f'{{ [ -n "$FBINK_BIN" ] && "$FBINK_BIN" -q -c -f -g file={q_remote} 2>/dev/null; }} || /usr/sbin/eips -f -g {q_remote} >/dev/null 2>&1'
-            if do_full
-            else f'{{ [ -n "$FBINK_BIN" ] && "$FBINK_BIN" -q -g file={q_remote} 2>/dev/null; }} || /usr/sbin/eips -g {q_remote} >/dev/null 2>&1'
-        )
+            candidates: list[str] = []
+            for cand in (primary_host, cfg_fallback, learned_lan_ip):
+                if cand and cand not in candidates:
+                    candidates.append(cand)
 
-        remote_script = (
-            f"cat > {q_remote} && "
-            "lipc-set-prop -i com.lab126.powerd preventScreenSaver 1 >/dev/null 2>&1 || true; "
-            + fw_snippet
-            + fl_snippet
-            + "FBINK_BIN=$(command -v fbink || ls /mnt/us/usbnet/bin/fbink /mnt/us/koreader/fbink /mnt/us/libkh/bin/fbink 2>/dev/null | head -n 1); "
-            + draw_cmd
-        )
+            host = ""
+            for cand in candidates:
+                try:
+                    with socket.create_connection((cand, port), timeout=1.5):
+                        host = cand
+                        break
+                except OSError:
+                    continue
 
-        key_path = Path(ssh_key).expanduser() if ssh_key else None
-        ssh_cmd = ["ssh", "-o", "BatchMode=yes", *SSH_COMPAT_OPTS, "-p", str(port)]
-        if key_path and key_path.exists():
-            ssh_cmd.extend(["-i", str(key_path)])
-        ssh_cmd.extend([f"{user}@{host}", remote_script])
-
-        png_bytes = PNG_PATH.read_bytes()
-        try:
-            proc = subprocess.run(
-                ssh_cmd,
-                input=png_bytes,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=12,
-            )
-            # If key isn't enrolled yet on a brand-new USBNetLite install, enroll automatically and retry once!
-            if proc.returncode != 0 and key_path and key_path.exists():
-                if self._bootstrap_ssh_key(host, port, user, key_path, default_pw):
-                    proc = subprocess.run(
-                        ssh_cmd,
-                        input=png_bytes,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                        timeout=12,
-                    )
-
-            if proc.returncode == 0:
-                mode_lbl = "full flash" if do_full else "gentle refresh"
-                msg = f"Live on Kindle ({host} · {mode_lbl})"
+            if not host:
+                msg = f"Standby · Waiting for Kindle at {primary_host}:{port} (;un)"
                 with self.lock:
-                    self.push_count += 1
-                    self.last_push_epoch = time.time()
-                    self.last_push_ok = True
+                    self.last_push_ok = False
                     self.last_push_msg = msg
-                log.info(msg)
-                return True, msg
+                if force_full_refresh:
+                    log.warning("Kindle unreachable on %s (port %d)", ", ".join(candidates), port)
+                return False, msg
 
-            err = proc.stderr.decode("utf-8", errors="replace").strip()
-            msg = f"SSH auth/cmd error ({host}): {err[:120]}"
-            with self.lock:
-                self.last_push_ok = False
-                self.last_push_msg = msg
-            log.warning(msg)
-            return False, msg
-        except Exception as exc:
-            msg = f"Push error ({host}): {exc}"
-            with self.lock:
-                self.last_push_ok = False
-                self.last_push_msg = msg
-            log.warning(msg)
-            return False, msg
+            featherweight = bool(k_cfg.get("featherweight_mode", True))
+            fl_mode = str(k_cfg.get("frontlight_mode", "touch"))
+            fl_level = max(1, min(24, int(k_cfg.get("frontlight_level", 14))))
+            fl_secs = max(5, int(k_cfg.get("frontlight_seconds", 20)))
+            do_full = force_full_refresh or (push_num % full_every == 0)
+            q_remote = shlex.quote(remote_img)
+            lan_ip = _detect_lan_ip("192.168.50.222")
+
+            fw_snippet = (
+                'if status lab126_gui 2>/dev/null | grep -q "start/running"; then stop lab126_gui >/dev/null 2>&1 || true; sleep 1; fi; '
+                if featherweight
+                else ""
+            )
+            fl_conf = (
+                f'printf "MODE={fl_mode}\\nBRIGHT={fl_level}\\nHOLD_SECS={fl_secs}\\n'
+                f'HOST_USB=http://192.168.15.201:{srv_port}\\nHOST_LAN=http://{lan_ip}:{srv_port}\\n" > /tmp/zen_touch_light.conf; '
+                'LPID=$(cat /tmp/zen_touch_light.pid 2>/dev/null || true); '
+                'if [ -z "$LPID" ] || ! kill -0 "$LPID" 2>/dev/null; then '
+                "rm -f /tmp/zen_touch_light.pid; "
+                "start-stop-daemon -S -b -p /tmp/zen_touch_light.pid -x /bin/sh -- /mnt/us/extensions/kindle-dashboard/bin/touch_light.sh >/dev/null 2>&1 || true; "
+                "fi; "
+            )
+            if fl_mode == "off":
+                fl_snippet = fl_conf + "lipc-set-prop -i com.lab126.powerd flIntensity 0 >/dev/null 2>&1 || true; "
+            elif fl_mode == "always":
+                fl_snippet = fl_conf + f"lipc-set-prop -i com.lab126.powerd flIntensity {fl_level} >/dev/null 2>&1 || true; "
+            else:
+                fl_snippet = fl_conf
+
+            draw_inner = (
+                f'{{ [ -n "$FBINK_BIN" ] && "$FBINK_BIN" -q -c -f -g file={q_remote} 2>/dev/null; }} || /usr/sbin/eips -f -g {q_remote} >/dev/null 2>&1'
+                if do_full
+                else f'{{ [ -n "$FBINK_BIN" ] && "$FBINK_BIN" -q -g file={q_remote} 2>/dev/null; }} || /usr/sbin/eips -g {q_remote} >/dev/null 2>&1'
+            )
+            draw_cmd = f'if [ ! -d /tmp/zen_rotate.lock ]; then {draw_inner}; fi'
+
+            remote_script = (
+                f'TMP_IMG={q_remote}.push.$$ && cat > "$TMP_IMG" && mv -f "$TMP_IMG" {q_remote} && '
+                "lipc-set-prop -i com.lab126.powerd preventScreenSaver 1 >/dev/null 2>&1 || true; "
+                + fw_snippet
+                + fl_snippet
+                + "FBINK_BIN=$(command -v fbink || ls /mnt/us/usbnet/bin/fbink /mnt/us/koreader/fbink /mnt/us/libkh/bin/fbink 2>/dev/null | head -n 1); "
+                + draw_cmd
+            )
+
+            key_path = Path(ssh_key).expanduser() if ssh_key else None
+            ssh_cmd = ["ssh", "-o", "BatchMode=yes", *SSH_COMPAT_OPTS, "-p", str(port)]
+            if key_path and key_path.exists():
+                ssh_cmd.extend(["-i", str(key_path)])
+            ssh_cmd.extend([f"{user}@{host}", remote_script])
+
+            png_bytes = PNG_PATH.read_bytes()
+            try:
+                proc = subprocess.run(
+                    ssh_cmd,
+                    input=png_bytes,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=12,
+                )
+                # If key isn't enrolled yet on a brand-new USBNetLite install, enroll automatically and retry once!
+                if proc.returncode != 0 and key_path and key_path.exists():
+                    if self._bootstrap_ssh_key(host, port, user, key_path, default_pw):
+                        proc = subprocess.run(
+                            ssh_cmd,
+                            input=png_bytes,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            timeout=12,
+                        )
+
+                if proc.returncode == 0:
+                    mode_lbl = "full flash" if do_full else "gentle refresh"
+                    msg = f"Live on Kindle ({host} · {mode_lbl})"
+                    with self.lock:
+                        self.push_count += 1
+                        self.last_push_epoch = time.time()
+                        self.last_push_ok = True
+                        self.last_push_msg = msg
+                    log.info(msg)
+                    return True, msg
+
+                err = proc.stderr.decode("utf-8", errors="replace").strip()
+                msg = f"SSH auth/cmd error ({host}): {err[:120]}"
+                with self.lock:
+                    self.last_push_ok = False
+                    self.last_push_msg = msg
+                log.warning(msg)
+                return False, msg
+            except Exception as exc:
+                msg = f"Push error ({host}): {exc}"
+                with self.lock:
+                    self.last_push_ok = False
+                    self.last_push_msg = msg
+                log.warning(msg)
+                return False, msg
 
 
 STUDIO_HTML = """<!DOCTYPE html>
@@ -501,12 +589,7 @@ STUDIO_HTML = """<!DOCTYPE html>
       <button class="primary" onclick="postJSON('/api/next-quote', {})">Next Quote ✨</button>
 
       <select id="authorSelect" onchange="updateSettings({author_filter: this.value})" title="Filter by Teacher">
-        <option value="all">Teacher: All Five</option>
-        <option value="Alan Watts">Alan Watts</option>
-        <option value="Thích Nhất Hạnh">Thích Nhất Hạnh</option>
-        <option value="Ram Dass">Ram Dass</option>
-        <option value="Pema Chödrön">Pema Chödrön</option>
-        <option value="Jon Kabat-Zinn">Jon Kabat-Zinn</option>
+        <option value="all">Teacher: All Teachers</option>
       </select>
 
       <select id="buddySelect" onchange="updateSettings({buddy_mode: this.value})" title="Choose Zen Companion">
@@ -550,6 +633,7 @@ STUDIO_HTML = """<!DOCTYPE html>
   <script>
     let current24h = false;
     let currentFeatherweight = true;
+    let authorsPopulated = false;
     let buddiesPopulated = false;
 
     async function refreshStatus() {
@@ -560,6 +644,17 @@ STUDIO_HTML = """<!DOCTYPE html>
         const q = d.quote || {};
         const b = d.buddy || {};
         const cfg = d.settings || {};
+
+        if (!authorsPopulated && d.available_authors) {
+          const asel = document.getElementById('authorSelect');
+          for (const author of d.available_authors) {
+            const opt = document.createElement('option');
+            opt.value = author;
+            opt.textContent = author;
+            asel.appendChild(opt);
+          }
+          authorsPopulated = true;
+        }
 
         if (!buddiesPopulated && d.available_buddies) {
           const sel = document.getElementById('buddySelect');
@@ -668,27 +763,50 @@ def make_handler(state: DashboardState) -> type[BaseHTTPRequestHandler]:
             except Exception:
                 return {}
 
+        def _handle_rotate(self, query: str) -> None:
+            params = parse_qs(query)
+            want_png = params.get("format", [""])[0].lower() == "png"
+            client_ip = self.client_address[0] if self.client_address else ""
+            if want_png:
+                state.note_kindle_client(client_ip)
+                with state.op_lock:
+                    state.rotate_clockwise(push=False, client_ip=client_ip)
+                    png_bytes = PNG_PATH.read_bytes()
+                self._send_bytes(png_bytes, "image/png")
+            else:
+                nxt = state.rotate_clockwise(push=True)
+                self._send_json({"ok": True, "orientation": nxt})
+
         def do_GET(self) -> None:
-            path = urlparse(self.path).path
+            parsed = urlparse(self.path)
+            path = parsed.path
 
             if path == "/":
                 self._send_bytes(STUDIO_HTML.encode("utf-8"), "text/html; charset=utf-8")
             elif path == "/kindle":
                 self._send_bytes(KINDLE_BROWSER_HTML.encode("utf-8"), "text/html; charset=utf-8")
             elif path == "/dashboard.png":
-                if not PNG_PATH.exists():
-                    state.render_now()
-                self._send_bytes(PNG_PATH.read_bytes(), "image/png")
+                if self.client_address:
+                    state.note_kindle_client(self.client_address[0])
+                with state.op_lock:
+                    if not PNG_PATH.exists():
+                        state.render_now(prefer_cached_weather=True, advance_quote=False)
+                    png_bytes = PNG_PATH.read_bytes()
+                self._send_bytes(png_bytes, "image/png")
             elif path == "/dashboard_preview.png":
-                target = PREVIEW_PNG_PATH if PREVIEW_PNG_PATH.exists() else PNG_PATH
-                if not target.exists():
-                    state.render_now()
+                with state.op_lock:
                     target = PREVIEW_PNG_PATH if PREVIEW_PNG_PATH.exists() else PNG_PATH
-                self._send_bytes(target.read_bytes(), "image/png")
+                    if not target.exists():
+                        state.render_now(prefer_cached_weather=True, advance_quote=False)
+                        target = PREVIEW_PNG_PATH if PREVIEW_PNG_PATH.exists() else PNG_PATH
+                    png_bytes = target.read_bytes()
+                self._send_bytes(png_bytes, "image/png")
             elif path == "/dashboard.svg":
-                if not SVG_PATH.exists():
-                    state.render_now()
-                self._send_bytes(SVG_PATH.read_bytes(), "image/svg+xml; charset=utf-8")
+                with state.op_lock:
+                    if not SVG_PATH.exists():
+                        state.render_now(prefer_cached_weather=True, advance_quote=False)
+                    svg_bytes = SVG_PATH.read_bytes()
+                self._send_bytes(svg_bytes, "image/svg+xml; charset=utf-8")
             elif path == "/api/status":
                 with state.lock:
                     disp = state.config["display"]
@@ -717,89 +835,92 @@ def make_handler(state: DashboardState) -> type[BaseHTTPRequestHandler]:
                     }
                 self._send_json(payload)
             elif path == "/api/rotate":
-                nxt = state.rotate_clockwise()
-                self._send_json({"ok": True, "orientation": nxt})
+                self._handle_rotate(parsed.query)
             else:
                 self._send_json({"error": "Not found"}, status=HTTPStatus.NOT_FOUND)
 
         def do_POST(self) -> None:
-            path = urlparse(self.path).path
+            parsed = urlparse(self.path)
+            path = parsed.path
             body = self._read_json_body()
 
             if path == "/api/next-quote":
-                with state.lock:
-                    state.quote_offset += 1
-                state.render_now()
-                state.push_to_kindle(force_full_refresh=False)
+                with state.op_lock:
+                    with state.lock:
+                        state.quote_offset += 1
+                    state.render_now(prefer_cached_weather=True)
+                    state.push_to_kindle(force_full_refresh=False)
                 self._send_json({"ok": True, "quote_offset": state.quote_offset})
             elif path == "/api/rotate":
-                nxt = state.rotate_clockwise()
-                self._send_json({"ok": True, "orientation": nxt})
+                self._handle_rotate(parsed.query)
             elif path == "/api/settings":
                 full_flash = False
                 restore_ui = False
-                with state.lock:
-                    disp = state.config["display"]
-                    q_cfg = state.config["quotes"]
-                    k_cfg = state.config.setdefault("kindle", {})
-                    if "theme" in body and body["theme"] in ("light", "dark", "auto"):
-                        disp["theme"] = body["theme"]
-                        full_flash = True
-                    if "orientation" in body and body["orientation"] in ROTATION_ORDER:
-                        disp["orientation"] = body["orientation"]
-                        full_flash = True
-                    if "time_format_24h" in body:
-                        disp["time_format_24h"] = bool(body["time_format_24h"])
-                    if "featherweight_mode" in body:
-                        fw_val = bool(body["featherweight_mode"])
-                        k_cfg["featherweight_mode"] = fw_val
-                        full_flash = True
-                        if not fw_val:
-                            restore_ui = True
-                    if "frontlight_mode" in body and body["frontlight_mode"] in ("touch", "off", "always"):
-                        k_cfg["frontlight_mode"] = str(body["frontlight_mode"])
-                    if "author_filter" in body:
-                        val = str(body["author_filter"])
-                        if val == "all" or val in AUTHORS:
-                            q_cfg["author_filter"] = val
-                    if "buddy_mode" in body:
-                        bval = str(body["buddy_mode"])
-                        if bval == "auto" or bval in BUDDY_BY_KEY:
-                            q_cfg["buddy_mode"] = bval
-                    state.save_config()
-                if restore_ui:
-                    host = str(k_cfg.get("host", "192.168.15.244"))
-                    port = int(k_cfg.get("port", 22))
-                    user = str(k_cfg.get("user", "root"))
-                    fl_lvl = max(1, min(24, int(k_cfg.get("frontlight_level", 14))))
-                    key_path = Path(str(k_cfg.get("ssh_key", "")).strip()).expanduser()
-                    cmd = ["ssh", "-o", "BatchMode=yes", *SSH_COMPAT_OPTS, "-p", str(port)]
-                    if key_path.exists():
-                        cmd.extend(["-i", str(key_path)])
-                    cmd.extend(
-                        [
-                            f"{user}@{host}",
-                            f'LPID=$(cat /tmp/zen_touch_light.pid 2>/dev/null || true); [ -n "$LPID" ] && kill "$LPID" >/dev/null 2>&1 || true; rm -f /tmp/zen_touch_light.pid; lipc-set-prop -i com.lab126.powerd flIntensity {fl_lvl} >/dev/null 2>&1 || true; start lab126_gui >/dev/null 2>&1 || true',
-                        ]
-                    )
-                    subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=8)
-                state.render_now()
-                if not restore_ui:
-                    state.push_to_kindle(force_full_refresh=full_flash)
+                with state.op_lock:
+                    with state.lock:
+                        disp = state.config["display"]
+                        q_cfg = state.config["quotes"]
+                        k_cfg = state.config.setdefault("kindle", {})
+                        if "theme" in body and body["theme"] in ("light", "dark", "auto"):
+                            disp["theme"] = body["theme"]
+                            full_flash = True
+                        if "orientation" in body and body["orientation"] in ROTATION_ORDER:
+                            disp["orientation"] = body["orientation"]
+                            full_flash = True
+                        if "time_format_24h" in body:
+                            disp["time_format_24h"] = bool(body["time_format_24h"])
+                        if "featherweight_mode" in body:
+                            fw_val = bool(body["featherweight_mode"])
+                            k_cfg["featherweight_mode"] = fw_val
+                            full_flash = True
+                            if not fw_val:
+                                restore_ui = True
+                        if "frontlight_mode" in body and body["frontlight_mode"] in ("touch", "off", "always"):
+                            k_cfg["frontlight_mode"] = str(body["frontlight_mode"])
+                        if "author_filter" in body:
+                            val = str(body["author_filter"])
+                            if val == "all" or val in AUTHORS:
+                                q_cfg["author_filter"] = val
+                        if "buddy_mode" in body:
+                            bval = str(body["buddy_mode"])
+                            if bval == "auto" or bval in BUDDY_BY_KEY:
+                                q_cfg["buddy_mode"] = bval
+                        state.save_config()
+                    if restore_ui:
+                        host = str(k_cfg.get("host", "192.168.15.244"))
+                        port = int(k_cfg.get("port", 22))
+                        user = str(k_cfg.get("user", "root"))
+                        fl_lvl = max(1, min(24, int(k_cfg.get("frontlight_level", 14))))
+                        key_path = Path(str(k_cfg.get("ssh_key", "")).strip()).expanduser()
+                        cmd = ["ssh", "-o", "BatchMode=yes", *SSH_COMPAT_OPTS, "-p", str(port)]
+                        if key_path.exists():
+                            cmd.extend(["-i", str(key_path)])
+                        cmd.extend(
+                            [
+                                f"{user}@{host}",
+                                f'LPID=$(cat /tmp/zen_touch_light.pid 2>/dev/null || true); [ -n "$LPID" ] && kill "$LPID" >/dev/null 2>&1 || true; rm -f /tmp/zen_touch_light.pid; lipc-set-prop -i com.lab126.powerd flIntensity {fl_lvl} >/dev/null 2>&1 || true; start lab126_gui >/dev/null 2>&1 || true',
+                            ]
+                        )
+                        subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=8)
+                    state.render_now(prefer_cached_weather=True)
+                    if not restore_ui:
+                        state.push_to_kindle(force_full_refresh=full_flash)
                 self._send_json({"ok": True})
             elif path == "/api/toggle-theme":
                 order = ["light", "dark", "auto"]
-                with state.lock:
-                    cur = state.config["display"].get("theme", "light")
-                    nxt = order[(order.index(cur) + 1) % len(order)] if cur in order else "light"
-                    state.config["display"]["theme"] = nxt
-                    state.save_config()
-                state.render_now()
-                state.push_to_kindle(force_full_refresh=True)
+                with state.op_lock:
+                    with state.lock:
+                        cur = state.config["display"].get("theme", "light")
+                        nxt = order[(order.index(cur) + 1) % len(order)] if cur in order else "light"
+                        state.config["display"]["theme"] = nxt
+                        state.save_config()
+                    state.render_now(prefer_cached_weather=True)
+                    state.push_to_kindle(force_full_refresh=True)
                 self._send_json({"ok": True, "theme": nxt})
             elif path == "/api/push":
-                state.render_now()
-                ok, msg = state.push_to_kindle(force_full_refresh=True)
+                with state.op_lock:
+                    state.render_now(prefer_cached_weather=False)
+                    ok, msg = state.push_to_kindle(force_full_refresh=True)
                 self._send_json({"ok": ok, "message": msg})
             else:
                 self._send_json({"error": "Not found"}, status=HTTPStatus.NOT_FOUND)
@@ -815,8 +936,12 @@ def scheduler_loop(state: DashboardState, stop_event: threading.Event) -> None:
         if stop_event.wait(timeout=sleep_secs):
             break
         try:
-            state.render_now()
-            state.push_to_kindle(force_full_refresh=False)
+            state.render_now(prefer_cached_weather=False)
+            with state.op_lock:
+                with state.lock:
+                    recent_push = (time.time() - state.last_push_epoch) < 2.5
+                if not recent_push:
+                    state.push_to_kindle(force_full_refresh=False)
         except Exception as exc:
             log.exception("Minute update failed: %s", exc)
 

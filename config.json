@@ -15,7 +15,7 @@
     "full_refresh_every_n_pushes": 20
   },
   "quotes": {
-    "rotate_minutes": 60,
+    "rotate_minutes": 1,
     "author_filter": "all",
     "buddy_mode": "auto"
   },
@@ -29,6 +29,7 @@
     "frontlight_level": 14,
     "frontlight_seconds": 20,
     "host": "192.168.15.244",
+    "fallback_host": "192.168.50.79",
     "user": "root",
     "port": 22,
     "ssh_key": "~/.ssh/kindle_usbnet",

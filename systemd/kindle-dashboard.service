@@ -5,8 +5,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/home/billy/kindle-display
-ExecStart=/usr/bin/python3 /home/billy/kindle-display/dashboard.py
+WorkingDirectory=/home/billy/paper-monk
+ExecStart=/usr/bin/python3 /home/billy/paper-monk/dashboard.py
 Restart=always
 RestartSec=5
 
